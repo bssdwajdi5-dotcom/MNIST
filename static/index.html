@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MNIST — reconnaissance de chiffres</title>
+<style>
+  :root { --accent:#1f77d0; --bg:#f6f7f9; --panel:#ffffff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif; background:var(--bg); color:#222; }
+  header { padding:14px 22px; background:var(--panel); border-bottom:1px solid #e3e3e3; }
+  header h1 { margin:0; font-size:19px; }
+  header p { margin:4px 0 0; color:#666; font-size:13px; }
+  .wrap { display:flex; gap:18px; padding:18px 22px; flex-wrap:wrap; align-items:flex-start; }
+  .panel { background:var(--panel); border:1px solid #e3e3e3; border-radius:10px; padding:14px; }
+  #cv { display:block; background:#101010; border-radius:6px; touch-action:none; cursor:crosshair; }
+  .tools { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:12px; }
+  .tools label { font-size:13px; }
+  button { font:inherit; font-size:13px; padding:7px 13px; border-radius:7px; border:1px solid #c9d3dd; background:#fff; cursor:pointer; }
+  button:hover { background:#eef4fb; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { background:#1a68b8; }
+  h3 { margin:0 0 8px; font-size:14px; }
+  #prev { display:block; background:#101010; border-radius:4px; image-rendering:pixelated; }
+  .pred { display:flex; align-items:center; gap:14px; margin:14px 0 6px; }
+  #digit { font-size:64px; font-weight:700; color:var(--accent); min-width:70px; text-align:center; }
+  #conf { font-size:22px; font-weight:700; }
+  .muted { color:#777; font-size:12px; }
+  .barrow { display:flex; align-items:center; gap:6px; margin:3px 0; font-size:11px; }
+  .barrow .d { width:12px; font-weight:700; text-align:center; }
+  .bartrack { flex:1; height:13px; background:#ececec; border-radius:3px; overflow:hidden; }
+  .barfill { height:100%; width:1%; background:#8fb8e0; transition:width .15s; }
+  .barfill.best { background:var(--accent); }
+  .barrow .v { width:52px; text-align:right; color:#555; }
+  #status { margin-top:12px; font-size:12px; color:#666; min-height:32px; }
+  #err { color:#c0392b; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MNIST — reconnaissance de chiffres manuscrits</h1>
+  <p id="meta">Modèle CNN chargé…</p>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <canvas id="cv" width="560" height="560"></canvas>
+    <div class="tools">
+      <label>Pinceau :</label>
+      <label><input type="radio" name="brush" value="8"> Fine</label>
+      <label><input type="radio" name="brush" value="12" checked> Moyenne</label>
+      <label><input type="radio" name="brush" value="18"> Épaisse</label>
+      <button id="clear">Effacer</button>
+      <button id="pred" class="primary">Prédire</button>
+      <button id="ex">Exemple au hasard</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Ce que voit le modèle (28×28)</h3>
+    <canvas id="prev" width="28" height="28" style="width:168px;height:168px"></canvas>
+
+    <div class="pred">
+      <div id="digit">—</div>
+      <div>
+        <div class="muted">Classe prédite</div>
+        <div id="conf">—</div>
+      </div>
+    </div>
+
+    <h3>Probabilités par classe</h3>
+    <div id="bars"></div>
+    <div id="status">Dessinez un chiffre dans le cadre noir.</div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const prev = document.getElementById('prev');
+const pctx = prev.getContext('2d');
+const statusEl = document.getElementById('status');
+
+const RASTER = 280, SCALE = 2;      // 560 px de canvas -> 280 px de raster
+let radius = 12, strokes = [], base28 = null, drawing = false, busy = false;
+
+ctx.fillStyle = '#101010';
+ctx.fillRect(0, 0, cv.width, cv.height);
+
+// --- barres de probabilités ---
+const barsEl = document.getElementById('bars');
+const rows = [];
+for (let d = 0; d < 10; d++) {
+  const row = document.createElement('div');
+  row.className = 'barrow';
+  row.innerHTML = `<span class="d">${d}</span><span class="bartrack"><span class="barfill"></span></span><span class="v">0.0 %</span>`;
+  barsEl.appendChild(row);
+  rows.push({ fill: row.querySelector('.barfill'), val: row.querySelector('.v') });
+}
+
+function setBars(probs, best) {
+  probs.forEach((p, d) => {
+    rows[d].fill.style.width = Math.max(1, p * 100) + '%';
+    rows[d].fill.classList.toggle('best', d === best);
+    rows[d].val.textContent = (p * 100).toFixed(1) + ' %';
+  });
+}
+function setPreview(px) {
+  const rgba = new Uint8ClampedArray(28 * 28 * 4);
+  for (let i = 0; i < 28 * 28; i++) {
+    const v = px[i];
+    rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = v;
+    rgba[i * 4 + 3] = 255;
+  }
+  pctx.putImageData(new ImageData(rgba, 28, 28), 0, 0);
+}
+function render(d) {
+  if (d.empty) {
+    document.getElementById('digit').textContent = '—';
+    document.getElementById('conf').textContent = '—';
+    setBars(new Array(10).fill(0.1), -1);
+    statusEl.textContent = 'Dessinez un chiffre dans le cadre noir.';
+    return;
+  }
+  const best = d.probs.indexOf(Math.max(...d.probs));
+  document.getElementById('digit').textContent = d.label;
+  document.getElementById('conf').textContent = (d.confidence * 100).toFixed(1) + ' %';
+  setBars(d.probs, best);
+  setPreview(d.preview28);
+  let msg = `Prédiction en ${d.ms} ms · précision test ${(d.test_acc * 100).toFixed(2)} %`;
+  if (d.true_label !== undefined) {
+    msg = `Exemple MNIST n°${d.index} — étiquette réelle : ${d.true_label} · ` +
+          (d.label === d.true_label ? 'correct ✓' : 'erreur ✗') + ' · ' + msg;
+  }
+  statusEl.textContent = msg;
+}
+
+async function call(url, payload) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+async function predict() {
+  if (busy) return;
+  if (!strokes.length && !base28) { render({ empty: true }); return; }
+  busy = true;
+  statusEl.textContent = 'Prédiction…';
+  try {
+    const payload = { radius, strokes };
+    if (base28) payload.base28 = base28;
+    render(await call('/api/predict', payload));
+  } catch (e) {
+    statusEl.innerHTML = '<span id="err">Erreur : ' + e.message + '</span>';
+  } finally {
+    busy = false;
+  }
+}
+
+// --- dessin ---
+function toGrid(e) {
+  const r = cv.getBoundingClientRect();
+  const x = (e.clientX - r.left) * (cv.width / r.width);
+  const y = (e.clientY - r.top) * (cv.height / r.height);
+  return [
+    Math.max(0, Math.min(RASTER - 1, Math.floor(x / SCALE))),
+    Math.max(0, Math.min(RASTER - 1, Math.floor(y / SCALE))),
+  ];
+}
+function drawSegment(a, b, w) {
+  ctx.strokeStyle = ctx.fillStyle = '#fff';
+  ctx.lineWidth = w;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(a[0] * SCALE + SCALE / 2, a[1] * SCALE + SCALE / 2);
+  ctx.lineTo(b[0] * SCALE + SCALE / 2, b[1] * SCALE + SCALE / 2);
+  ctx.stroke();
+}
+cv.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  cv.setPointerCapture(e.pointerId);
+  drawing = true;
+  const p = toGrid(e);
+  strokes.push([p]);
+  drawSegment(p, p, radius * 4);
+});
+cv.addEventListener('pointermove', (e) => {
+  if (!drawing) return;
+  const p = toGrid(e);
+  const stroke = strokes[strokes.length - 1];
+  const last = stroke[stroke.length - 1];
+  stroke.push(p);
+  drawSegment(last, p, radius * 4);
+});
+function endStroke() {
+  if (!drawing) return;
+  drawing = false;
+  predict();
+}
+cv.addEventListener('pointerup', endStroke);
+cv.addEventListener('pointercancel', endStroke);
+
+// --- contrôles ---
+document.querySelectorAll('input[name=brush]').forEach((el) =>
+  el.addEventListener('change', () => { radius = parseInt(el.value, 10); })
+);
+document.getElementById('pred').addEventListener('click', predict);
+document.getElementById('clear').addEventListener('click', () => {
+  strokes = []; base28 = null;
+  ctx.fillStyle = '#101010';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  render({ empty: true });
+});
+document.getElementById('ex').addEventListener('click', async () => {
+  const btn = document.getElementById('ex');
+  btn.disabled = true;
+  try {
+    const d = await call('/api/example');
+    base28 = d.image28; strokes = [];
+    // affichage : 28x28 agrandi x20 sans lissage
+    const off = document.createElement('canvas');
+    off.width = off.height = 28;
+    const octx = off.getContext('2d');
+    const rgba = new Uint8ClampedArray(28 * 28 * 4);
+    for (let i = 0; i < 28 * 28; i++) {
+      rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = d.image28[i];
+      rgba[i * 4 + 3] = 255;
+    }
+    octx.putImageData(new ImageData(rgba, 28, 28), 0, 0);
+    ctx.fillStyle = '#101010';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, 0, 0, cv.width, cv.height);
+    render(d);
+  } catch (e) {
+    statusEl.innerHTML = '<span id="err">Erreur : ' + e.message + '</span>';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// --- état initial ---
+fetch('/api/health').then((r) => r.json()).then((h) => {
+  document.getElementById('meta').textContent =
+    `Modèle CNN · précision test ${(h.test_acc * 100).toFixed(2)} % · checkpoint ${h.checkpoint}`;
+}).catch(() => { document.getElementById('meta').textContent = 'Serveur injoignable'; });
+setBars(new Array(10).fill(0.1), -1);
+</script>
+</body>
+</html>
